@@ -2,7 +2,7 @@ from fastmcp import FastMCP
 import os 
 import sqlite3
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "expenses.db")
+DB_PATH = os.environ.get("EXPENSES_DB_PATH", os.path.join(os.path.dirname(__file__), "expenses.db"))
   
 mcp= FastMCP("ExpenseTracker")
 
@@ -46,6 +46,9 @@ def list_expenses(start_date, end_date):
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols,r)) for r in cur.fetchall()]
 
-if __name__ == "__main__":
+def main():
     mcp.run(transport="http", host="0.0.0.0", port=8000)
+
+if __name__ == "__main__":
+    main()
     
