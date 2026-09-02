@@ -1,0 +1,19 @@
+[project]
+name = "test-remote-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "vaibhav668", email = "vpokh@example.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=4.0.1",
+]
+
+[project.scripts]
+test-remote-server = "test_remote_server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
