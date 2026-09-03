@@ -1,84 +1,141 @@
 from fastmcp import FastMCP
+import aiosqlite
+import asyncio
 import os
-import sqlite3
 from pathlib import Path
-from datetime import datetime
+from datetime import date
 
+
+# ============================================================
+# FASTMCP SERVER
+# ============================================================
 
 mcp = FastMCP("ExpenseTracker")
 
 
-# --------------------------------------------------
+# ============================================================
 # DATABASE CONFIGURATION
-# --------------------------------------------------
+# ============================================================
 
-# Use EXPENSES_DB_PATH if provided.
-# Otherwise store the DB in /tmp, which is normally writable
-# in container/server environments.
-DB_PATH = os.environ.get(
-    "EXPENSES_DB_PATH",
-    "/tmp/expenses.db"
-)
+# You can override this using:
+#
+# EXPENSES_DB_PATH=/path/to/expenses.db
+#
+# Otherwise, use a writable local directory.
 
-DB_PATH = os.path.abspath(DB_PATH)
+DEFAULT_DB_DIR = Path(__file__).resolve().parent / "data"
 
-# Make sure the parent directory exists
-db_dir = os.path.dirname(DB_PATH)
+DB_PATH = Path(
+    os.environ.get(
+        "EXPENSES_DB_PATH",
+        str(DEFAULT_DB_DIR / "expenses.db")
+    )
+).resolve()
 
-if db_dir:
-    os.makedirs(db_dir, exist_ok=True)
 
-
-# --------------------------------------------------
+# ============================================================
 # DATABASE CONNECTION
-# --------------------------------------------------
+# ============================================================
 
-def get_connection():
+async def get_db():
     """
-    Create a SQLite connection with read/write access.
-    """
-    conn = sqlite3.connect(DB_PATH)
-
-    # Foreign keys
-    conn.execute("PRAGMA foreign_keys = ON")
-
-    return conn
-
-
-# --------------------------------------------------
-# INITIALIZE DATABASE
-# --------------------------------------------------
-
-def init_db():
-    """
-    Create the expenses table if it doesn't already exist.
+    Create and return an async SQLite connection.
     """
 
-    with get_connection() as conn:
+    # Make sure the database directory exists
+    DB_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
-        conn.execute("""
+    db = await aiosqlite.connect(str(DB_PATH))
+
+    # Return rows as dictionaries
+    db.row_factory = aiosqlite.Row
+
+    # Enable foreign keys
+    await db.execute("PRAGMA foreign_keys = ON")
+
+    # WAL allows better concurrent read/write performance.
+    await db.execute("PRAGMA journal_mode = WAL")
+
+    # Busy timeout prevents immediate "database is locked" errors.
+    await db.execute("PRAGMA busy_timeout = 5000")
+
+    return db
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+async def init_db():
+    """
+    Create the database and expenses table.
+    """
+
+    DB_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+
                 date TEXT NOT NULL,
-                amount REAL NOT NULL,
+
+                amount REAL NOT NULL
+                    CHECK(amount >= 0),
+
                 category TEXT NOT NULL,
+
                 subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT ''
+
+                note TEXT DEFAULT '',
+
+                created_at TEXT
+                    DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        conn.commit()
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expenses_date
+            ON expenses(date)
+        """)
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expenses_category
+            ON expenses(category)
+        """)
+
+        await db.commit()
 
 
-init_db()
+# ============================================================
+# SERVER STARTUP
+# ============================================================
+
+async def startup():
+    """
+    Initialize everything required before the MCP server starts.
+    """
+
+    await init_db()
+
+    print(
+        f"Expense database initialized at:\n{DB_PATH}"
+    )
 
 
-# --------------------------------------------------
+# ============================================================
 # ADD EXPENSE
-# --------------------------------------------------
+# ============================================================
 
 @mcp.tool()
-def add_expense(
+async def add_expense(
     date: str,
     amount: float,
     category: str,
@@ -87,153 +144,297 @@ def add_expense(
 ):
     """
     Add a new expense to the database.
+
+    Args:
+        date: Expense date in YYYY-MM-DD format.
+        amount: Expense amount.
+        category: Main expense category.
+        subcategory: Optional subcategory.
+        note: Optional note.
+
+    Returns:
+        Details of the newly created expense.
     """
 
-    with get_connection() as conn:
+    # --------------------------------------------------------
+    # Validate date
+    # --------------------------------------------------------
 
-        cursor = conn.execute(
-            """
-            INSERT INTO expenses
-            (date, amount, category, subcategory, note)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                date,
-                amount,
-                category,
-                subcategory,
-                note
+    try:
+        date.fromisoformat(date)
+    except ValueError:
+        return {
+            "status": "error",
+            "message": "Invalid date. Use YYYY-MM-DD format."
+        }
+
+    # --------------------------------------------------------
+    # Validate amount
+    # --------------------------------------------------------
+
+    if amount < 0:
+        return {
+            "status": "error",
+            "message": "Amount cannot be negative."
+        }
+
+    # --------------------------------------------------------
+    # Validate category
+    # --------------------------------------------------------
+
+    if not category.strip():
+        return {
+            "status": "error",
+            "message": "Category cannot be empty."
+        }
+
+    # --------------------------------------------------------
+    # Database operation
+    # --------------------------------------------------------
+
+    try:
+
+        async with await get_db() as db:
+
+            cursor = await db.execute(
+                """
+                INSERT INTO expenses (
+                    date,
+                    amount,
+                    category,
+                    subcategory,
+                    note
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    date,
+                    amount,
+                    category.strip(),
+                    subcategory.strip(),
+                    note.strip()
+                )
             )
-        )
 
-        conn.commit()
+            await db.commit()
+
+            expense_id = cursor.lastrowid
 
         return {
             "status": "ok",
-            "message": "Expense added successfully",
-            "id": cursor.lastrowid,
-            "date": date,
-            "amount": amount,
-            "category": category,
-            "subcategory": subcategory,
-            "note": note
+            "message": "Expense added successfully.",
+            "expense": {
+                "id": expense_id,
+                "date": date,
+                "amount": amount,
+                "category": category.strip(),
+                "subcategory": subcategory.strip(),
+                "note": note.strip()
+            }
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to add expense: {str(e)}"
         }
 
 
-# --------------------------------------------------
-# LIST EXPENSES
-# --------------------------------------------------
+# ============================================================
+# GET EXPENSE BY ID
+# ============================================================
 
 @mcp.tool()
-def list_expenses(
-    start_date: str,
-    end_date: str
-):
+async def get_expense(expense_id: int):
     """
-    List all expenses between start_date and end_date.
+    Get a single expense by its ID.
     """
 
-    with get_connection() as conn:
+    try:
 
-        cursor = conn.execute(
-            """
-            SELECT
-                id,
-                date,
-                amount,
-                category,
-                subcategory,
-                note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date ASC, id ASC
-            """,
-            (start_date, end_date)
-        )
+        async with await get_db() as db:
 
-        columns = [description[0] for description in cursor.description]
+            cursor = await db.execute(
+                """
+                SELECT
+                    id,
+                    date,
+                    amount,
+                    category,
+                    subcategory,
+                    note,
+                    created_at
+                FROM expenses
+                WHERE id = ?
+                """,
+                (expense_id,)
+            )
 
-        rows = cursor.fetchall()
+            row = await cursor.fetchone()
 
-        return [
-            dict(zip(columns, row))
-            for row in rows
-        ]
-
-
-# --------------------------------------------------
-# GET ALL EXPENSES
-# --------------------------------------------------
-
-@mcp.tool()
-def get_all_expenses():
-    """
-    Get every expense stored in the database.
-    """
-
-    with get_connection() as conn:
-
-        cursor = conn.execute("""
-            SELECT
-                id,
-                date,
-                amount,
-                category,
-                subcategory,
-                note
-            FROM expenses
-            ORDER BY date ASC, id ASC
-        """)
-
-        columns = [description[0] for description in cursor.description]
-
-        return [
-            dict(zip(columns, row))
-            for row in cursor.fetchall()
-        ]
-
-
-# --------------------------------------------------
-# DELETE EXPENSE
-# --------------------------------------------------
-
-@mcp.tool()
-def delete_expense(expense_id: int):
-    """
-    Delete an expense using its ID.
-    """
-
-    with get_connection() as conn:
-
-        cursor = conn.execute(
-            """
-            DELETE FROM expenses
-            WHERE id = ?
-            """,
-            (expense_id,)
-        )
-
-        conn.commit()
-
-        if cursor.rowcount == 0:
+        if row is None:
             return {
                 "status": "error",
-                "message": f"No expense found with id {expense_id}"
+                "message": f"No expense found with ID {expense_id}."
             }
 
         return {
             "status": "ok",
-            "message": "Expense deleted successfully",
-            "id": expense_id
+            "expense": dict(row)
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to get expense: {str(e)}"
         }
 
 
-# --------------------------------------------------
-# UPDATE EXPENSE
-# --------------------------------------------------
+# ============================================================
+# LIST EXPENSES BY DATE RANGE
+# ============================================================
 
 @mcp.tool()
-def update_expense(
+async def list_expenses(
+    start_date: str,
+    end_date: str
+):
+    """
+    List all expenses between two dates.
+
+    Dates must be in YYYY-MM-DD format.
+    """
+
+    # --------------------------------------------------------
+    # Validate dates
+    # --------------------------------------------------------
+
+    try:
+        date.fromisoformat(start_date)
+        date.fromisoformat(end_date)
+    except ValueError:
+
+        return {
+            "status": "error",
+            "message": "Dates must use YYYY-MM-DD format."
+        }
+
+    if start_date > end_date:
+
+        return {
+            "status": "error",
+            "message": "start_date cannot be after end_date."
+        }
+
+    # --------------------------------------------------------
+    # Query database
+    # --------------------------------------------------------
+
+    try:
+
+        async with await get_db() as db:
+
+            cursor = await db.execute(
+                """
+                SELECT
+                    id,
+                    date,
+                    amount,
+                    category,
+                    subcategory,
+                    note,
+                    created_at
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date ASC, id ASC
+                """,
+                (
+                    start_date,
+                    end_date
+                )
+            )
+
+            rows = await cursor.fetchall()
+
+        expenses = [
+            dict(row)
+            for row in rows
+        ]
+
+        return {
+            "status": "ok",
+            "start_date": start_date,
+            "end_date": end_date,
+            "count": len(expenses),
+            "expenses": expenses
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to list expenses: {str(e)}"
+        }
+
+
+# ============================================================
+# GET ALL EXPENSES
+# ============================================================
+
+@mcp.tool()
+async def get_all_expenses():
+    """
+    Get every expense stored in the database.
+    """
+
+    try:
+
+        async with await get_db() as db:
+
+            cursor = await db.execute(
+                """
+                SELECT
+                    id,
+                    date,
+                    amount,
+                    category,
+                    subcategory,
+                    note,
+                    created_at
+                FROM expenses
+                ORDER BY date DESC, id DESC
+                """
+            )
+
+            rows = await cursor.fetchall()
+
+        expenses = [
+            dict(row)
+            for row in rows
+        ]
+
+        return {
+            "status": "ok",
+            "count": len(expenses),
+            "expenses": expenses
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to get expenses: {str(e)}"
+        }
+
+
+# ============================================================
+# UPDATE EXPENSE
+# ============================================================
+
+@mcp.tool()
+async def update_expense(
     expense_id: int,
     date: str,
     amount: float,
@@ -245,98 +446,322 @@ def update_expense(
     Update an existing expense.
     """
 
-    with get_connection() as conn:
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
 
-        cursor = conn.execute(
-            """
-            UPDATE expenses
-            SET
-                date = ?,
-                amount = ?,
-                category = ?,
-                subcategory = ?,
-                note = ?
-            WHERE id = ?
-            """,
-            (
-                date,
-                amount,
-                category,
-                subcategory,
-                note,
-                expense_id
+    try:
+        date.fromisoformat(date)
+    except ValueError:
+
+        return {
+            "status": "error",
+            "message": "Invalid date. Use YYYY-MM-DD format."
+        }
+
+    if amount < 0:
+
+        return {
+            "status": "error",
+            "message": "Amount cannot be negative."
+        }
+
+    if not category.strip():
+
+        return {
+            "status": "error",
+            "message": "Category cannot be empty."
+        }
+
+    # --------------------------------------------------------
+    # Update database
+    # --------------------------------------------------------
+
+    try:
+
+        async with await get_db() as db:
+
+            cursor = await db.execute(
+                """
+                UPDATE expenses
+                SET
+                    date = ?,
+                    amount = ?,
+                    category = ?,
+                    subcategory = ?,
+                    note = ?
+                WHERE id = ?
+                """,
+                (
+                    date,
+                    amount,
+                    category.strip(),
+                    subcategory.strip(),
+                    note.strip(),
+                    expense_id
+                )
             )
-        )
 
-        conn.commit()
+            await db.commit()
 
-        if cursor.rowcount == 0:
+            rows_updated = cursor.rowcount
+
+        if rows_updated == 0:
+
             return {
                 "status": "error",
-                "message": f"No expense found with id {expense_id}"
+                "message": f"No expense found with ID {expense_id}."
             }
 
         return {
             "status": "ok",
-            "message": "Expense updated successfully",
+            "message": "Expense updated successfully.",
             "id": expense_id
-        }
-
-
-# --------------------------------------------------
-# DATABASE INFO / HEALTH CHECK
-# --------------------------------------------------
-
-@mcp.tool()
-def database_info():
-    """
-    Check database location and whether read/write operations work.
-    """
-
-    try:
-
-        with get_connection() as conn:
-
-            # Test write operation using a temporary table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS __write_test (
-                    id INTEGER PRIMARY KEY
-                )
-            """)
-
-            conn.execute("""
-                INSERT INTO __write_test DEFAULT VALUES
-            """)
-
-            conn.execute("""
-                DELETE FROM __write_test
-            """)
-
-            conn.commit()
-
-        return {
-            "status": "ok",
-            "database": DB_PATH,
-            "read": True,
-            "write": True
         }
 
     except Exception as e:
 
         return {
             "status": "error",
-            "database": DB_PATH,
+            "message": f"Failed to update expense: {str(e)}"
+        }
+
+
+# ============================================================
+# DELETE EXPENSE
+# ============================================================
+
+@mcp.tool()
+async def delete_expense(expense_id: int):
+    """
+    Delete an expense by ID.
+    """
+
+    try:
+
+        async with await get_db() as db:
+
+            cursor = await db.execute(
+                """
+                DELETE FROM expenses
+                WHERE id = ?
+                """,
+                (expense_id,)
+            )
+
+            await db.commit()
+
+            rows_deleted = cursor.rowcount
+
+        if rows_deleted == 0:
+
+            return {
+                "status": "error",
+                "message": f"No expense found with ID {expense_id}."
+            }
+
+        return {
+            "status": "ok",
+            "message": "Expense deleted successfully.",
+            "id": expense_id
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to delete expense: {str(e)}"
+        }
+
+
+# ============================================================
+# EXPENSE SUMMARY
+# ============================================================
+
+@mcp.tool()
+async def expense_summary(
+    start_date: str,
+    end_date: str
+):
+    """
+    Get expense totals and category-wise spending
+    between two dates.
+    """
+
+    try:
+
+        date.fromisoformat(start_date)
+        date.fromisoformat(end_date)
+
+    except ValueError:
+
+        return {
+            "status": "error",
+            "message": "Dates must use YYYY-MM-DD format."
+        }
+
+    try:
+
+        async with await get_db() as db:
+
+            # ------------------------------------------------
+            # Total
+            # ------------------------------------------------
+
+            cursor = await db.execute(
+                """
+                SELECT
+                    COUNT(*) AS count,
+                    COALESCE(SUM(amount), 0) AS total
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+                """,
+                (
+                    start_date,
+                    end_date
+                )
+            )
+
+            total_row = await cursor.fetchone()
+
+            # ------------------------------------------------
+            # Category breakdown
+            # ------------------------------------------------
+
+            cursor = await db.execute(
+                """
+                SELECT
+                    category,
+                    COUNT(*) AS count,
+                    SUM(amount) AS total
+                FROM expenses
+                WHERE date BETWEEN ? AND ?
+                GROUP BY category
+                ORDER BY total DESC
+                """,
+                (
+                    start_date,
+                    end_date
+                )
+            )
+
+            category_rows = await cursor.fetchall()
+
+        return {
+            "status": "ok",
+            "period": {
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "total_expenses": total_row["count"],
+            "total_amount": total_row["total"],
+            "categories": [
+                dict(row)
+                for row in category_rows
+            ]
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "message": f"Failed to generate summary: {str(e)}"
+        }
+
+
+# ============================================================
+# DATABASE HEALTH CHECK
+# ============================================================
+
+@mcp.tool()
+async def database_info():
+    """
+    Check whether the database supports both read and write
+    operations.
+    """
+
+    try:
+
+        # ----------------------------------------------------
+        # Check file permissions
+        # ----------------------------------------------------
+
+        DB_PATH.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        # ----------------------------------------------------
+        # Open database
+        # ----------------------------------------------------
+
+        async with await get_db() as db:
+
+            # READ TEST
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS count FROM expenses"
+            )
+
+            row = await cursor.fetchone()
+
+            current_count = row["count"]
+
+            # WRITE TEST
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS __write_test (
+                    id INTEGER PRIMARY KEY
+                )
+                """
+            )
+
+            await db.execute(
+                """
+                INSERT INTO __write_test DEFAULT VALUES
+                """
+            )
+
+            await db.execute(
+                """
+                DELETE FROM __write_test
+                """
+            )
+
+            await db.commit()
+
+        return {
+            "status": "ok",
+            "database_path": str(DB_PATH),
+            "database_exists": DB_PATH.exists(),
             "read": True,
+            "write": True,
+            "expense_count": current_count
+        }
+
+    except Exception as e:
+
+        return {
+            "status": "error",
+            "database_path": str(DB_PATH),
+            "database_exists": DB_PATH.exists(),
+            "read": False,
             "write": False,
             "error": str(e)
         }
 
 
-# --------------------------------------------------
-# START SERVER
-# --------------------------------------------------
+# ============================================================
+# SERVER ENTRY POINT
+# ============================================================
 
-def main():
+async def main():
+    """
+    Start the FastMCP server.
+    """
+
+    await startup()
+
+    # FastMCP's HTTP server itself is started by mcp.run().
     mcp.run(
         transport="http",
         host="0.0.0.0",
@@ -344,5 +769,9 @@ def main():
     )
 
 
+# ============================================================
+# RUN
+# ============================================================
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
